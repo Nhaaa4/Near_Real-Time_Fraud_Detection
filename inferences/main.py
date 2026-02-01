@@ -1,5 +1,7 @@
 import logging
 import os
+from datetime import datetime, timedelta
+from typing import Dict
 
 from dotenv import load_dotenv
 import joblib
@@ -7,13 +9,14 @@ import yaml
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
-    from_json, col, hour, dayofmonth, dayofweek, month, when, lit,
-    log1p, to_timestamp, avg, stddev, count, approx_count_distinct, sum as spark_sum,
-    lag, unix_timestamp
+    col, hour, dayofmonth, dayofweek, month, when, lit,
+    log1p, to_timestamp, avg, stddev, count, approx_count_distinct, 
+    sum as spark_sum, lag, unix_timestamp, coalesce, current_timestamp, expr
 )
 from pyspark.sql.window import Window
 from pyspark.sql.pandas.functions import pandas_udf
-from pyspark.sql.types import (StructType, StructField, StringType, IntegerType, DoubleType, TimestampType)
+from pyspark.sql.types import DoubleType
+import pandas as pd
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,17 +25,17 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-class FraudDetectionInference:
-    bootstrap_servers = None
-    topic = None
-    security_protocal = None
-    sasl_mechanism = None
-    username = None
-    password = None
-    sasl_jass_config = None
-    
+class BatchFraudInference:
     def __init__(self, config_path="/app/config.yaml"):
         load_dotenv(dotenv_path='/app/.env')
+        
+        self.hdfs_url = os.getenv('HDFS_URL', 'hdfs://namenode:9000')
+        self.hdfs_input_path = os.getenv('HDFS_PATH', '/fraud_detection/transactions')
+        self.hdfs_output_path = os.getenv('HDFS_OUTPUT_PATH', '/fraud_detection/predictions')
+        
+        logger.info(f"HDFS URL: {self.hdfs_url}")
+        logger.info(f"Input path: {self.hdfs_input_path}")
+        logger.info(f"Output path: {self.hdfs_output_path}")
         
         self.config = self._load_config(config_path)
         self.spark = self._init_spark_session()
@@ -40,7 +43,7 @@ class FraudDetectionInference:
         self.model = self._load_model(self.config["model"]["path"])
         self.broadcast_model = self.spark.sparkContext.broadcast(self.model)
         
-        logger.debug(f"Environment variables laoded: {dict(os.environ)}")
+        logger.info("Batch inference initialized successfully")
     
     def _load_config(self, config_path):
         try:
@@ -52,17 +55,19 @@ class FraudDetectionInference:
         
     def _init_spark_session(self):
         try:
-            packages = self.config.get("spark", {}).get("packages", "")
-            builder = SparkSession.builder.appName("FraudDetectionInferenceStreaming")
+            spark = SparkSession.builder \
+                .appName("BatchFraudInference") \
+                .config("spark.hadoop.fs.defaultFS", self.hdfs_url) \
+                .config("spark.hadoop.hadoop.user.name", "hadoop") \
+                .config("spark.sql.shuffle.partitions", "200") \
+                .config("spark.driver.memory", "2g") \
+                .config("spark.executor.memory", "2g") \
+                .getOrCreate()
             
-            if packages:
-                builder = builder.config('spark.jars.packages', packages)
-            
-            spark = builder.getOrCreate()
-            logger.info("Spark Session initialized.")
+            logger.info("Spark Session initialized for batch inference")
             return spark
         except Exception as e:
-            logger.error(f"Error Initializing Spark Session: {str(e)}")
+            logger.error(f"Error initializing Spark Session: {str(e)}")
             raise e
     
     def _load_model(self, model_path):
@@ -74,280 +79,325 @@ class FraudDetectionInference:
             logger.error(f"Error loading model: {str(e)}")
             raise e
     
-    def read_from_kafka(self):
-        logger.info(f"Setting up Kafka read stream from topic: {self.config['kafka']['topic']}")
-        
-        kafka_config = self.config['kafka']
-        kafka_bootstrap_servers = kafka_config.get("bootstrap_servers", "kafka:29092")
-        kafka_topic = kafka_config.get("topic", "transactions")
-        kafka_security_protocol = kafka_config.get("security_protocol", "PLAINTEXT")
-        kafka_sasl_mechanism = kafka_config.get("sasl_mechanism", "PLAIN")
-        kafka_username = kafka_config.get("username", "")
-        kafka_password = kafka_config.get("password", "")
-        
-        self.bootstrap_servers = kafka_bootstrap_servers
-        self.topic = kafka_topic
-        self.security_protocol = kafka_security_protocol
-        self.sasl_mechanism = kafka_sasl_mechanism
-        self.username = kafka_username
-        self.password = kafka_password
-        
-        # Only set JAAS config if username and password are provided
-        if kafka_username and kafka_password:
-            self.sasl_jaas_config = (
-                f"org.apache.kafka.common.security.plain.PlainLoginModule required "
-                f"username='{kafka_username}' password='{kafka_password}';"
-            )
-        else:
-            self.sasl_jaas_config = None
-        
-        json_schema = StructType([
-            StructField("transaction_id", StringType(), True),
-            StructField("sender_account", StringType(), True),
-            StructField("receiver_account", StringType(), True),
-            StructField("amount", DoubleType(), True),
-            StructField("transaction_type", StringType(), True),
-            StructField("merchant_category", StringType(), True),
-            StructField("location", StringType(), True),
-            StructField("device_used", StringType(), True),
-            StructField("is_fraud", IntegerType(), True),
-            StructField("fraud_type", StringType(), True),
-            StructField("time_since_last_transaction", DoubleType(), True),
-            StructField("spending_deviation_score", DoubleType(), True),
-            StructField("velocity_score", IntegerType(), True),
-            StructField("geo_anomaly_score", DoubleType(), True),
-            StructField("payment_channel", StringType(), True),
-            StructField("ip_address", StringType(), True),
-            StructField("device_hash", StringType(), True),
-            StructField("timestamp", StringType(), True)
-        ])
-        
-        # Build Kafka read stream options
-        kafka_options = {
-            "kafka.bootstrap.servers": kafka_bootstrap_servers,
-            "subscribe": kafka_topic,
-            "startingOffsets": "latest",
-            "kafka.security.protocol": kafka_security_protocol
-        }
-        
-        # Only add SASL options if credentials are provided
-        if self.sasl_jaas_config:
-            kafka_options["kafka.sasl.mechanism"] = kafka_sasl_mechanism
-            kafka_options["kafka.sasl.jaas.config"] = self.sasl_jaas_config
-        
-        stream_reader = self.spark.readStream.format("kafka")
-        for key, value in kafka_options.items():
-            stream_reader = stream_reader.option(key, value)
-        
-        df = stream_reader.load()
+    def load_data_from_hdfs(self, time_window_hours=1):
+        try:
+            full_path = f"{self.hdfs_url}{self.hdfs_input_path}"
+            logger.info(f"Reading data from HDFS: {full_path}")
             
-        parsed_df = df.selectExpr("CAST(value AS STRING)") \
-            .select(from_json(col("value"), json_schema).alias("data")) \
-            .select("data.*")
-        
-        return parsed_df
+            df = self.spark.read.option("basePath", full_path).parquet(f"{full_path}/timestamp=*")
+            
+            # Convert timestamp partition column (string) to timestamp type
+            if "timestamp" in df.columns:
+                df = df.withColumn("timestamp_parsed", to_timestamp(col("timestamp")))
+                
+                # Filter to recent data (last N hours)
+                if time_window_hours > 0:
+                    cutoff_time = current_timestamp() - expr(f"INTERVAL {time_window_hours} HOURS")
+                    df = df.filter(col("timestamp_parsed") >= cutoff_time)
+                    logger.info(f"Filtered to last {time_window_hours} hours")
+            else:
+                logger.warning("No timestamp column found, skipping time filtering")
+            
+            record_count = df.count()
+            logger.info(f"Loaded {record_count} transactions from HDFS")
+            
+            return df
+            
+        except Exception as e:
+            logger.error(f"Error loading data from HDFS: {str(e)}")
+            raise
     
-    def add_features(self, df):
-        df = df.withColumn("timestamp_parsed", to_timestamp(col("timestamp")))
+    def apply_full_feature_engineering(self, df):
+        logger.info("Starting FULL feature engineering pipeline...")
         
-        # Basic time features
+        # Parse timestamp and extract temporal features
+        if "timestamp_parsed" not in df.columns:
+            df = df.withColumn("timestamp_parsed", to_timestamp(col("timestamp")))
+        
         df = df.withColumn("hour", hour(col("timestamp_parsed")))
         df = df.withColumn("day", dayofmonth(col("timestamp_parsed")))
         df = df.withColumn("day_of_week", dayofweek(col("timestamp_parsed")))
         df = df.withColumn("month", month(col("timestamp_parsed")))
         
-        logger.info("Computing features for streaming inference...")
+        # Sort by timestamp (CRITICAL for window functions)
+        df = df.orderBy("timestamp_parsed")
         
-        # === STREAMING-FRIENDLY FEATURES (no aggregations needed) ===
+        # Label encode categorical columns
+        categorical_mappings = self._get_categorical_mappings()
         
-        # 1. Amount-based features
+        for col_name, mapping in categorical_mappings.items():
+            if col_name in df.columns:
+                expr = None
+                for key, value in mapping.items():
+                    if expr is None:
+                        expr = when(col(col_name) == key, value)
+                    else:
+                        expr = expr.when(col(col_name) == key, value)
+                expr = expr.otherwise(0)
+                df = df.withColumn(col_name, expr)
+        
+        logger.info("Preprocessing completed")
+    
+        logger.info("Computing window-based aggregation features...")
+        
+        # Define window specifications (WORKS IN BATCH MODE!)
+        sender_window = Window.partitionBy("sender_account").orderBy("timestamp_parsed") \
+            .rangeBetween(Window.unboundedPreceding, Window.currentRow)
+        # Window specifications for different operations
+        # For aggregations that support frames
+        sender_window_with_frame = Window.partitionBy("sender_account").orderBy("timestamp_parsed") \
+            .rangeBetween(Window.unboundedPreceding, Window.currentRow)
+        
+        sender_day_window = Window.partitionBy("sender_account", "day").orderBy("timestamp_parsed") \
+            .rangeBetween(Window.unboundedPreceding, Window.currentRow)
+        
+        receiver_window_with_frame = Window.partitionBy("receiver_account").orderBy("timestamp_parsed") \
+            .rangeBetween(Window.unboundedPreceding, Window.currentRow)
+        
+        # For lag/lead functions that don't support frames
+        sender_window_no_frame = Window.partitionBy("sender_account").orderBy("timestamp_parsed")
+        
+        # === Amount Features ===
+        df = df.withColumn("amount_per_velocity", 
+                          col("amount") / (col("velocity_score") + 1))
         df = df.withColumn("amount_log", log1p(col("amount")))
-        df = df.withColumn("amount_squared", col("amount") * col("amount"))
-        df = df.withColumn("amount_per_velocity", col("amount") / (col("velocity_score") + 1))
         
-        # 2. Risk score interactions
-        df = df.withColumn("deviation_squared", col("spending_deviation_score") * col("spending_deviation_score"))
-        df = df.withColumn("risk_score_total", col("spending_deviation_score") + col("geo_anomaly_score") + col("velocity_score"))
-        df = df.withColumn("risk_score_product", col("spending_deviation_score") * col("geo_anomaly_score") * col("velocity_score"))
+        # Real sender average (not default!)
+        df = df.withColumn("sender_avg_amount", avg("amount").over(sender_window_with_frame))
+        df = df.withColumn("amount_to_avg_ratio", 
+                          col("amount") / coalesce(col("sender_avg_amount"), lit(1.0)))
         
-        # 3. Time-based features
-        df = df.withColumn("is_night_transaction", when(col("hour").between(22, 6), 1).otherwise(0))
-        df = df.withColumn("is_business_hours", when(col("hour").between(9, 17), 1).otherwise(0))
-        df = df.withColumn("is_weekend", when(col("day_of_week").isin([1, 7]), 1).otherwise(0))
-        df = df.withColumn("is_month_end", when(col("day") >= 25, 1).otherwise(0))
+        # === Frequency Features ===
+        df = df.withColumn("transaction_per_day", count("*").over(sender_day_window))
         
-        # 4. Transaction characteristics
-        df = df.withColumn("is_self_transfer", when(col("sender_account") == col("receiver_account"), 1).otherwise(0))
-        df = df.withColumn("is_high_amount", when(col("amount") > 1000, 1).otherwise(0))
-        df = df.withColumn("is_round_amount", when(col("amount") % 100 == 0, 1).otherwise(0))
+        # Calculate real transaction gap (use window without frame for lag)
+        df = df.withColumn("prev_timestamp", lag("timestamp_parsed").over(sender_window_no_frame))
+        df = df.withColumn("transaction_gap", 
+                          when(col("prev_timestamp").isNotNull(),
+                               unix_timestamp("timestamp_parsed") - unix_timestamp("prev_timestamp"))
+                          .otherwise(col("time_since_last_transaction")))
         
-        # 5. Use data from raw input (these come from the producer)
-        df = df.withColumn("transaction_gap", col("time_since_last_transaction"))
-        df = df.withColumn("is_rapid_transaction", when(col("time_since_last_transaction") < 60, 1).otherwise(0))
+        # === Risk Features ===
+        df = df.withColumn("is_night_transaction", 
+                          when(col("hour").between(18, 24), 1).otherwise(0))
+        df = df.withColumn("is_weekend", 
+                          when(col("day_of_week").isin([1, 7]), 1).otherwise(0))
+        df = df.withColumn("is_self_transfer", 
+                          when(col("sender_account") == col("receiver_account"), 1).otherwise(0))
         
-        # 6. Velocity and anomaly ratios
-        df = df.withColumn("velocity_to_geo_ratio", when(col("geo_anomaly_score") > 0, 
-                                                          col("velocity_score") / col("geo_anomaly_score")).otherwise(0.0))
-        df = df.withColumn("amount_deviation_ratio", col("amount") * col("spending_deviation_score"))
+        # === Network Features (REAL VALUES!) ===
+        df = df.withColumn("sender_degree", 
+                          approx_count_distinct("receiver_account").over(sender_window_with_frame))
+        df = df.withColumn("receiver_degree", 
+                          approx_count_distinct("sender_account").over(receiver_window_with_frame))
+        df = df.withColumn("sender_total_transaction", count("*").over(sender_window_with_frame))
+        df = df.withColumn("receiver_total_transaction", count("*").over(receiver_window_with_frame))
         
-        # 7. Default values for historical features
-        df = df.withColumn("sender_total_transaction", lit(1))
-        df = df.withColumn("sender_avg_amount", col("amount")) 
-        df = df.withColumn("sender_std_amount", lit(0.0))
-        df = df.withColumn("sender_degree", lit(1))
-        df = df.withColumn("sender_fraud_transaction", lit(0))
-        df = df.withColumn("transaction_per_day", lit(1))
-        df = df.withColumn("receiver_total_transaction", lit(1))
-        df = df.withColumn("receiver_degree", lit(1))
-        df = df.withColumn("receiver_fraud_transaction", lit(0))
-        df = df.withColumn("sender_fraud_percentage", lit(0.0))
-        df = df.withColumn("receiver_fraud_percentage", lit(0.0))
-        df = df.withColumn("amount_to_avg_ratio", lit(1.0))
+        # === Aggregation Features (REAL VALUES!) ===
+        df = df.withColumn("sender_std_amount", 
+                          coalesce(stddev("amount").over(sender_window_with_frame), lit(0.0)))
         
-        logger.info("Feature engineering completed.")
+        # === Fraud Features (from historical data) ===
+        df = df.withColumn("sender_fraud_transaction", 
+                          spark_sum(when(col("is_fraud") == 1, 1).otherwise(0)).over(sender_window_with_frame))
+        df = df.withColumn("receiver_fraud_transaction", 
+                          spark_sum(when(col("is_fraud") == 1, 1).otherwise(0)).over(receiver_window_with_frame))
+        df = df.withColumn("sender_fraud_percentage", 
+                          (col("sender_fraud_transaction") * 100.0 / col("sender_total_transaction")))
+        df = df.withColumn("receiver_fraud_percentage", 
+                          (col("receiver_fraud_transaction") * 100.0 / col("receiver_total_transaction")))
+        
+        # === Other Features ===
+        df = df.withColumn("deviation_squared", 
+                          col("spending_deviation_score") * col("spending_deviation_score"))
+        
+        # Drop temporary columns
+        df = df.drop("prev_timestamp")
+        
+        logger.info("Feature engineering completed with window aggregates")
+        logger.info("All features computed from streaming data using rolling windows")
         
         return df
     
-    def run_inference(self):
-        import pandas as pd
-        
-        df = self.read_from_kafka()
-        feature_df = self.add_features(df)
-        feature_df = feature_df.withWatermark("timestamp_parsed", "24 hours")
-        broadcast_model = self.broadcast_model
-
-        @pandas_udf("int")
-        def predict_udf(
-            sender_account: pd.Series,
-            receiver_account: pd.Series,
-            amount: pd.Series,
-            transaction_type: pd.Series,
-            merchant_category: pd.Series,
-            location: pd.Series,
-            device_used: pd.Series,
-            time_since_last_transaction: pd.Series,
-            spending_deviation_score: pd.Series,
-            velocity_score: pd.Series,
-            geo_anomaly_score: pd.Series,
-            payment_channel: pd.Series,
-            ip_address: pd.Series,
-            device_hash: pd.Series,
-            hour: pd.Series,
-            day: pd.Series,
-            day_of_week: pd.Series,
-            month: pd.Series,
-            amount_per_velocity: pd.Series,
-            amount_log: pd.Series,
-            amount_to_avg_ratio: pd.Series,
-            transaction_per_day: pd.Series,
-            transaction_gap: pd.Series,
-            is_night_transaction: pd.Series,
-            is_weekend: pd.Series,
-            is_self_transfer: pd.Series,
-            sender_degree: pd.Series,
-            receiver_degree: pd.Series,
-            sender_total_transaction: pd.Series,
-            receiver_total_transaction: pd.Series,
-            sender_avg_amount: pd.Series,
-            sender_std_amount: pd.Series,
-            sender_fraud_transaction: pd.Series,
-            receiver_fraud_transaction: pd.Series,
-            sender_fraud_percentage: pd.Series,
-            receiver_fraud_percentage: pd.Series,
-            deviation_squared: pd.Series
-        ) -> pd.Series:
-            
-            input_df = pd.DataFrame({
-                "sender_account": sender_account,
-                "receiver_account": receiver_account,
-                "amount": amount,
-                "transaction_type": transaction_type,
-                "merchant_category": merchant_category,
-                "location": location,
-                "device_used": device_used,
-                "time_since_last_transaction": time_since_last_transaction,
-                "spending_deviation_score": spending_deviation_score,
-                "velocity_score": velocity_score,
-                "geo_anomaly_score": geo_anomaly_score,
-                "payment_channel": payment_channel,
-                "ip_address": ip_address,
-                "device_hash": device_hash,
-                "hour": hour,
-                "day": day,
-                "day_of_week": day_of_week,
-                "month": month,
-                "amount_per_velocity": amount_per_velocity,
-                "amount_log": amount_log,
-                "amount_to_avg_ratio": amount_to_avg_ratio,
-                "transaction_per_day": transaction_per_day,
-                "transaction_gap": transaction_gap,
-                "is_night_transaction": is_night_transaction,
-                "is_weekend": is_weekend,
-                "is_self_transfer": is_self_transfer,
-                "sender_degree": sender_degree,
-                "receiver_degree": receiver_degree,
-                "sender_total_transaction": sender_total_transaction,
-                "receiver_total_transaction": receiver_total_transaction,
-                "sender_avg_amount": sender_avg_amount,
-                "sender_std_amount": sender_std_amount,
-                "sender_fraud_transaction": sender_fraud_transaction,
-                "receiver_fraud_transaction": receiver_fraud_transaction,
-                "sender_fraud_percentage": sender_fraud_percentage,
-                "receiver_fraud_percentage": receiver_fraud_percentage,
-                "deviation_squared": deviation_squared
-            })
-            probabilities = broadcast_model.value.predict_proba(input_df)[:, 1]
-            threshold = 0.60  # Tuned based on precision/recall requirements
-            predictions = (probabilities >= threshold).astype(int)
-            return pd.Series(predictions)
-
-        # Apply predictions to streaming DataFrame
-        prediction_df = feature_df.withColumn("prediction", predict_udf(
-            *[col(f) for f in [
-                "sender_account", "receiver_account", "amount", "transaction_type",
-                "merchant_category", "location", "device_used", "time_since_last_transaction",
-                "spending_deviation_score", "velocity_score", "geo_anomaly_score",
-                "payment_channel", "ip_address", "device_hash",
-                "hour", "day", "day_of_week", "month",
-                "amount_per_velocity", "amount_log", "amount_to_avg_ratio",
-                "transaction_per_day", "transaction_gap", "is_night_transaction", "is_weekend",
-                "is_self_transfer", "sender_degree", "receiver_degree", "sender_total_transaction",
-                "receiver_total_transaction", "sender_avg_amount", "sender_std_amount",
-                "sender_fraud_transaction", "receiver_fraud_transaction", "sender_fraud_percentage",
-                "receiver_fraud_percentage", "deviation_squared"
-            ]]
-        ))
-
-        # Build Kafka write stream options
-        write_options = {
-            "kafka.bootstrap.servers": self.bootstrap_servers,
-            "topic": 'transactions',
-            "checkpointLocation": "checkpoints/checkpoint"
+    def _get_categorical_mappings(self) -> Dict[str, Dict]:
+        """Get categorical mappings for label encoding"""
+        return {
+            "transaction_type": {
+                "Online Purchase": 0, "Transfer": 1, "Withdrawal": 2, 
+                "Deposit": 3, "Payment": 4
+            },
+            "merchant_category": {
+                "Electronics": 0, "Grocery": 1, "Travel": 2, "Entertainment": 3,
+                "Healthcare": 4, "Retail": 5, "Dining": 6, "Utilities": 7,
+                "Fuel": 8, "Education": 9
+            },
+            "location": {
+                "US-CA": 0, "US-NY": 1, "US-TX": 2, "US-FL": 3,
+                "GB-LDN": 4, "CN-BJ": 5, "JP-TYO": 6, "IN-DEL": 7,
+                "BR-SP": 8, "AU-SYD": 9
+            },
+            "device_used": {
+                "Mobile": 0, "Desktop": 1, "Tablet": 2, "ATM": 3, "POS Terminal": 4
+            },
+            "payment_channel": {
+                "Mobile App": 0, "Web": 1, "ATM": 2, "POS": 3, "Branch": 4
+            }
         }
+    
+    def predict(self, df):
+        logger.info("Running predictions with XGBoost model...")
         
-        # Only add SASL options if credentials are provided
-        if self.sasl_jaas_config:
-            write_options["kafka.security.protocol"] = self.security_protocol
-            write_options["kafka.sasl.mechanism"] = self.sasl_mechanism
-            write_options["kafka.sasl.jaas.config"] = self.sasl_jaas_config
-        else:
-            write_options["kafka.security.protocol"] = "PLAINTEXT"
+        broadcast_model = self.broadcast_model
         
-        # Write results back to Kafka topic
-        stream_writer = prediction_df.selectExpr(
-            "CAST(transaction_id AS STRING) AS key",
-            "to_json(struct(*)) AS value"
-        ).writeStream.format("kafka").outputMode("update")
+        MODEL_FEATURES = [
+            "amount", "transaction_type", "merchant_category", "location", "device_used", 
+            "time_since_last_transaction", "spending_deviation_score", "velocity_score", 
+            "geo_anomaly_score", "payment_channel",
+            "hour", "day", "day_of_week", "month",
+            "amount_per_velocity", "amount_log", "amount_to_avg_ratio",
+            "transaction_per_day", "transaction_gap", "is_night_transaction",
+            "is_weekend", "is_self_transfer", "sender_degree", "receiver_degree",
+            "sender_total_transaction", "receiver_total_transaction",
+            "sender_avg_amount", "sender_std_amount", "sender_fraud_transaction",
+            "receiver_fraud_transaction", "sender_fraud_percentage",
+            "receiver_fraud_percentage", "deviation_squared"
+        ]
         
-        for key, value in write_options.items():
-            stream_writer = stream_writer.option(key, value)
+        # Define prediction function with proper type hints
+        @pandas_udf(DoubleType())
+        def predict_fraud_probability(*cols: pd.Series) -> pd.Series:
+            """Predict fraud probability with type-hinted columns"""
+            try:
+                input_df = pd.DataFrame({
+                    feature: cols[i] for i, feature in enumerate(MODEL_FEATURES)
+                })
+                probabilities = broadcast_model.value.predict_proba(input_df)[:, 1]
+                return pd.Series(probabilities)
+            except Exception as e:
+                logger.error(f"Prediction error: {str(e)}")
+                return pd.Series([0.0] * len(cols[0]) if len(cols) > 0 else [])
         
-        stream_writer.start().awaitTermination()
-
+        # Apply predictions
+        prediction_df = df.withColumn(
+            "fraud_probability",
+            predict_fraud_probability(*[col(f) for f in MODEL_FEATURES])
+        ).withColumn(
+            "fraud_prediction",
+            when(col("fraud_probability") >= 0.5, 1).otherwise(0)
+        ).withColumn(
+            "prediction_timestamp",
+            current_timestamp()
+        ).withColumn(
+            "model_version",
+            lit("v1.0")
+        )
+        
+        return prediction_df
+    
+    def save_predictions(self, df):
+        """Save predictions back to HDFS"""
+        
+        output_path = f"{self.hdfs_url}{self.hdfs_output_path}"
+        logger.info(f"Saving predictions to HDFS: {output_path}")
+        
+        # Select output columns
+        output_df = df.select(
+            "transaction_id",
+            "sender_account",
+            "receiver_account",
+            "amount",
+            "timestamp",
+            "is_fraud",
+            "fraud_prediction",
+            "fraud_probability",
+            "prediction_timestamp",
+            "model_version"
+        )
+        
+        # Write to HDFS in Parquet format
+        output_df.write \
+            .mode("append") \
+            .partitionBy("prediction_timestamp") \
+            .parquet(output_path)
+        
+        logger.info(f"Predictions saved to {output_path}")
+    
+    def run_batch_inference(self, time_window_hours=1):
+        """
+        Main execution: Load from HDFS, apply features, predict, save.
+        """
+        
+        try:
+            logger.info("=" * 80)
+            logger.info("STARTING BATCH FRAUD INFERENCE FROM HDFS")
+            logger.info("=" * 80)
+            
+            # Load data
+            df = self.load_data_from_hdfs(time_window_hours)
+            
+            if df.count() == 0:
+                logger.warning("No data found in HDFS for the specified time window")
+                return
+            
+            # Apply full feature engineering
+            df = self.apply_full_feature_engineering(df)
+            
+            # Run predictions
+            prediction_df = self.predict(df)
+            
+            # Calculate metrics
+            total_count = prediction_df.count()
+            fraud_count = prediction_df.filter(col("fraud_prediction") == 1).count()
+            fraud_rate = (fraud_count / total_count * 100) if total_count > 0 else 0
+            
+            logger.info("=" * 80)
+            logger.info("BATCH INFERENCE COMPLETED")
+            logger.info("=" * 80)
+            logger.info(f"Total transactions processed: {total_count:,}")
+            logger.info(f"Predicted frauds: {fraud_count:,}")
+            logger.info(f"Fraud rate: {fraud_rate:.2f}%")
+            logger.info("=" * 80)
+            
+            # Show sample predictions BEFORE saving
+            logger.info("\n" + "=" * 80)
+            logger.info("SAMPLE FRAUD DETECTIONS:")
+            logger.info("=" * 80)
+            
+            fraud_predictions = prediction_df.filter(col("fraud_prediction") == 1)
+            fraud_sample_count = fraud_predictions.count()
+            
+            if fraud_sample_count > 0:
+                logger.info(f"Showing {min(fraud_sample_count, 20)} fraud detections:\n")
+                fraud_predictions.select(
+                    "transaction_id", "sender_account", "receiver_account", 
+                    "amount", "fraud_probability", "timestamp"
+                ).show(20, truncate=False)
+            else:
+                logger.info("No fraudulent transactions detected in this batch")
+            
+            logger.info("=" * 80)
+            logger.info("ALL TRANSACTIONS SAMPLE (10 records):")
+            logger.info("=" * 80 + "\n")
+            prediction_df.select(
+                "transaction_id", "sender_account", "amount", 
+                "fraud_prediction", "fraud_probability"
+            ).show(10, truncate=False)
+            
+            # Save predictions
+            self.save_predictions(prediction_df)
+            
+        except Exception as e:
+            logger.error(f"Error in batch inference: {str(e)}")
+            raise
 
 if __name__ == "__main__":
-    # Initialize pipeline with configuration
-    inference = FraudDetectionInference("/app/config.yaml")
-
-    # Start streaming processing and block until termination
-    inference.run_inference()
+    # Get time window from environment or use default (1 hour)
+    time_window = int(os.getenv('BATCH_TIME_WINDOW_HOURS', '1'))
+    
+    logger.info(f"Starting batch inference with {time_window}-hour window")
+    
+    # Initialize and run
+    inference = BatchFraudInference("/app/config.yaml")
+    inference.run_batch_inference(time_window_hours=time_window)
+    
+    logger.info("Batch inference completed successfully")

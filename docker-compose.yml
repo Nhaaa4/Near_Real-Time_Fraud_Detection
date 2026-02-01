@@ -432,7 +432,7 @@ services:
       - fraud-detection
 
   consumer:
-    build: ./consumer
+    build: ./hdfs_consumer
     container_name: fraud-consumer
     env_file: .env
     depends_on:
@@ -440,6 +440,7 @@ services:
         condition: service_healthy
     volumes:
       - ./models:/app/models
+      - ./hdfs_consumer:/app
     restart: always
     deploy:
       resources:
@@ -449,21 +450,92 @@ services:
     networks:
       - fraud-detection
 
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    container_name: namenode
+    restart: always
+    ports:
+      - "9870:9870"
+      - "9000:9000"
+    volumes:
+      - hadoop_namenode:/hadoop/dfs/name
+    environment:
+      - CLUSTER_NAME=fraud-detection
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - CORE_CONF_hadoop_http_staticuser_user=hadoop
+      - HDFS_CONF_dfs_webhdfs_enabled=true
+      - HDFS_CONF_dfs_permissions_enabled=false
+    env_file:
+      - .env
+    networks:
+      - fraud-detection
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    container_name: datanode
+    restart: always
+    volumes:
+      - hadoop_datanode:/hadoop/dfs/data
+    environment:
+      - SERVICE_PRECONDITION=namenode:9870
+      - CORE_CONF_fs_defaultFS=hdfs://namenode:9000
+      - HDFS_CONF_dfs_permissions_enabled=false
+    env_file:
+      - .env
+    depends_on:
+      - namenode
+    networks:
+      - fraud-detection
+
+  hdfs-consumer:
+    build: ./hdfs_consumer
+    container_name: hdfs-consumer
+    command: python main.py
+    env_file: .env
+    environment:
+      - HDFS_URL=hdfs://namenode:9000
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - KAFKA_TOPIC=transactions
+    depends_on:
+      namenode:
+        condition: service_started
+      kafka:
+        condition: service_healthy
+    volumes:
+      - ./hdfs_consumer:/app
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: '2G'
+    networks:
+      - fraud-detection
+
   inference:
     build:
       context: ./inferences
       dockerfile: Dockerfile
     container_name: fraud-inference
+    command: python main.py
+    env_file: .env
+    environment:
+      - SPARK_DRIVER_MEMORY=2g
+      - SPARK_EXECUTOR_MEMORY=2g
+      - HDFS_URL=hdfs://namenode:9000
+      - HDFS_PATH=/fraud_detection/transactions
+      - HDFS_OUTPUT_PATH=/fraud_detection/predictions
+      - BATCH_TIME_WINDOW_HOURS=1
     depends_on:
+      namenode:
+        condition: service_started
       kafka:
         condition: service_healthy
     volumes:
       - ./models:/app/models
       - ./config.yaml:/app/config.yaml
       - ./.env:/app/.env
-    environment:
-      - SPARK_DRIVER_MEMORY=1g
-      - SPARK_EXECUTOR_MEMORY=1g
+      - ./inferences:/app
     restart: always
     deploy:
       resources:
@@ -477,6 +549,8 @@ volumes:
   postgres-db-volume:
   minio_data:
   kafka_data:
+  hadoop_namenode:
+  hadoop_datanode:
 
 networks:
   fraud-detection:

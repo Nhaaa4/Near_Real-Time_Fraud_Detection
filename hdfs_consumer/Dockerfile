@@ -18,7 +18,12 @@ RUN apt-get update && \
     libssl-dev \
     libsasl2-dev \
     pkg-config \
+    openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
+
+# Set Java home
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH=$PATH:$JAVA_HOME/bin
 
 # Install librdkafka
 RUN curl -fsSL https://github.com/confluentinc/librdkafka/archive/refs/tags/v2.8.0.tar.gz -o librdkafka.tar.gz && \
