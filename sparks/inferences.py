@@ -6,6 +6,8 @@ from typing import Dict
 from dotenv import load_dotenv
 import joblib
 import yaml
+import psycopg2
+from psycopg2.extras import execute_values
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -26,19 +28,29 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class BatchFraudInference:
-    def __init__(self, config_path="/app/config.yaml"):
-        load_dotenv(dotenv_path='/app/.env')
+    def __init__(self, config_path="config.yaml"):
+        load_dotenv()
         
         self.hdfs_url = os.getenv('HDFS_URL', 'hdfs://namenode:9000')
-        self.hdfs_input_path = os.getenv('HDFS_PATH', '/fraud_detection/transactions')
-        self.hdfs_output_path = os.getenv('HDFS_OUTPUT_PATH', '/fraud_detection/predictions')
+        hdfs_base_path = os.getenv('HDFS_PATH', '/fraud_detection')
+        self.hdfs_input_path = f"{hdfs_base_path}/transactions"
+        
+        # PostgreSQL configuration
+        self.pg_host = os.getenv('POSTGRES_HOST', 'localhost')
+        self.pg_port = os.getenv('POSTGRES_PORT', '5432')
+        self.pg_database = os.getenv('POSTGRES_DB', 'fraud_detection')
+        self.pg_user = os.getenv('POSTGRES_USER', 'postgres')
+        self.pg_password = os.getenv('POSTGRES_PASSWORD', 'postgres')
         
         logger.info(f"HDFS URL: {self.hdfs_url}")
         logger.info(f"Input path: {self.hdfs_input_path}")
-        logger.info(f"Output path: {self.hdfs_output_path}")
+        logger.info(f"PostgreSQL: {self.pg_user}@{self.pg_host}:{self.pg_port}/{self.pg_database}")
         
         self.config = self._load_config(config_path)
         self.spark = self._init_spark_session()
+        
+        # Initialize PostgreSQL connection
+        self._init_postgres_table()
         
         self.model = self._load_model(self.config["model"]["path"])
         self.broadcast_model = self.spark.sparkContext.broadcast(self.model)
@@ -54,6 +66,7 @@ class BatchFraudInference:
             raise e
         
     def _init_spark_session(self):
+        """Initialize Spark session with HDFS support"""
         try:
             spark = SparkSession.builder \
                 .appName("BatchFraudInference") \
@@ -68,6 +81,54 @@ class BatchFraudInference:
             return spark
         except Exception as e:
             logger.error(f"Error initializing Spark Session: {str(e)}")
+            raise e
+    
+    def _init_postgres_table(self):
+        """Initialize PostgreSQL table for storing predictions"""
+        try:
+            conn = psycopg2.connect(
+                host=self.pg_host,
+                port=self.pg_port,
+                database=self.pg_database,
+                user=self.pg_user,
+                password=self.pg_password
+            )
+            cursor = conn.cursor()
+            
+            # Create table if not exists
+            create_table_query = """
+            CREATE TABLE IF NOT EXISTS fraud_predictions (
+                id SERIAL PRIMARY KEY,
+                transaction_id VARCHAR(100) UNIQUE NOT NULL,
+                sender_account VARCHAR(50),
+                receiver_account VARCHAR(50),
+                amount DECIMAL(15, 2),
+                transaction_timestamp TIMESTAMP,
+                is_fraud INTEGER,
+                fraud_prediction INTEGER,
+                fraud_probability DECIMAL(5, 4),
+                prediction_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                model_version VARCHAR(20),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_fraud_predictions_transaction_id 
+                ON fraud_predictions(transaction_id);
+            CREATE INDEX IF NOT EXISTS idx_fraud_predictions_timestamp 
+                ON fraud_predictions(transaction_timestamp);
+            CREATE INDEX IF NOT EXISTS idx_fraud_predictions_fraud 
+                ON fraud_predictions(fraud_prediction);
+            """
+            
+            cursor.execute(create_table_query)
+            conn.commit()
+            cursor.close()
+            conn.close()
+            
+            logger.info("PostgreSQL table 'fraud_predictions' initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Error initializing PostgreSQL table: {str(e)}")
             raise e
     
     def _load_model(self, model_path):
@@ -295,10 +356,9 @@ class BatchFraudInference:
         return prediction_df
     
     def save_predictions(self, df):
-        """Save predictions back to HDFS"""
+        """Save predictions to PostgreSQL database"""
         
-        output_path = f"{self.hdfs_url}{self.hdfs_output_path}"
-        logger.info(f"Saving predictions to HDFS: {output_path}")
+        logger.info("Saving predictions to PostgreSQL...")
         
         # Select output columns
         output_df = df.select(
@@ -314,13 +374,62 @@ class BatchFraudInference:
             "model_version"
         )
         
-        # Write to HDFS in Parquet format
-        output_df.write \
-            .mode("append") \
-            .partitionBy("prediction_timestamp") \
-            .parquet(output_path)
+        # Convert to Pandas for batch insert
+        pandas_df = output_df.toPandas()
         
-        logger.info(f"Predictions saved to {output_path}")
+        try:
+            conn = psycopg2.connect(
+                host=self.pg_host,
+                port=self.pg_port,
+                database=self.pg_database,
+                user=self.pg_user,
+                password=self.pg_password
+            )
+            cursor = conn.cursor()
+            
+            # Prepare data for batch insert
+            records = [
+                (
+                    row['transaction_id'],
+                    row['sender_account'],
+                    row['receiver_account'],
+                    float(row['amount']),
+                    row['timestamp'],
+                    int(row['is_fraud']),
+                    int(row['fraud_prediction']),
+                    float(row['fraud_probability']),
+                    row['prediction_timestamp'],
+                    row['model_version']
+                )
+                for _, row in pandas_df.iterrows()
+            ]
+            
+            # Batch insert with ON CONFLICT DO UPDATE
+            insert_query = """
+            INSERT INTO fraud_predictions 
+                (transaction_id, sender_account, receiver_account, amount, 
+                 transaction_timestamp, is_fraud, fraud_prediction, fraud_probability, 
+                 prediction_timestamp, model_version)
+            VALUES %s
+            ON CONFLICT (transaction_id) 
+            DO UPDATE SET 
+                fraud_prediction = EXCLUDED.fraud_prediction,
+                fraud_probability = EXCLUDED.fraud_probability,
+                prediction_timestamp = EXCLUDED.prediction_timestamp,
+                model_version = EXCLUDED.model_version
+            """
+            
+            execute_values(cursor, insert_query, records)
+            conn.commit()
+            
+            logger.info(f"Successfully saved {len(records)} predictions to PostgreSQL")
+            
+            cursor.close()
+            conn.close()
+            
+        except Exception as e:
+            logger.error(f"Error saving to PostgreSQL: {str(e)}")
+            raise e
     
     def run_batch_inference(self, time_window_hours=1):
         """
@@ -397,7 +506,7 @@ if __name__ == "__main__":
     logger.info(f"Starting batch inference with {time_window}-hour window")
     
     # Initialize and run
-    inference = BatchFraudInference("/app/config.yaml")
+    inference = BatchFraudInference("config.yaml")
     inference.run_batch_inference(time_window_hours=time_window)
     
     logger.info("Batch inference completed successfully")

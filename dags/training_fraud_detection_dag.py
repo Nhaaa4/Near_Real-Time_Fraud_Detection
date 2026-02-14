@@ -20,23 +20,13 @@ default_args = {
 }
 
 def train_model_task(**context):
-    """
-    Weekly model retraining task.
-    
-    This function:
-    1. Loads the latest feature-engineered data
-    2. Trains a new XGBoost model
-    3. Evaluates performance
-    4. Saves the model to the models directory
-    5. Logs metrics to MLflow (if available)
-    """
     try:
-        logger.info("Starting weekly fraud detection model retraining")
+        logger.info("Starting monthly fraud detection model retraining")
+        logger.info("Loading data from PostgreSQL database...")
         
-        # Train model using the latest data
+        # Train model using data from PostgreSQL
         metrics = train_fraud_detection_model(
-            config_path='/app/config.yaml',
-            data_path='/app/DATA/feature_engineering.csv'
+            config_path='config.yaml'
         )
         
         logger.info(f"Model retraining completed successfully")
@@ -53,12 +43,12 @@ def train_model_task(**context):
 
 # Define the DAG
 with DAG(
-    dag_id='fraud_detection_weekly_retrain',
+    dag_id='fraud_detection_monthly_retrain',
     default_args=default_args,
-    description="Weekly retraining of fraud detection model for real-time transactions",
-    schedule='0 3 * * 0',  # Every Sunday at 3:00 AM
+    description="Monthly retraining of fraud detection model for near real-time transactions",
+    schedule='0 3 1 * *',  # First day of every month at 3:00 AM
     catchup=False,
-    tags=['fraud-detection', 'ml', 'weekly-retrain', 'production']
+    tags=['fraud-detection', 'ml', 'monthly-retrain', 'production']
 ) as dag:
     
     # Task 1: Validate environment and data
@@ -66,18 +56,18 @@ with DAG(
         task_id='validate_environment',
         bash_command="""
         echo "Validating training environment..."
-        test -f /app/config.yaml || (echo "Config file missing" && exit 1)
-        test -f /app/DATA/feature_engineering.csv || (echo "Training data missing" && exit 1)
+        test -f config.yaml || (echo "Config file missing" && exit 1)
+        echo "PostgreSQL connection will be validated during training"
         echo "✓ Environment validation passed"
         """
     )
     
-    # Task 2: Train the model (weekly)
+    # Task 2: Train the model (monthly)
     training_task = PythonOperator(
         task_id='train_fraud_detection_model',
         python_callable=train_model_task,
         provide_context=True,
-        execution_timeout=timedelta(hours=2)
+        execution_timeout=timedelta(hours=3)
     )
     
     # Task 3: Validate model output
@@ -85,9 +75,9 @@ with DAG(
         task_id='validate_model',
         bash_command="""
         echo "Validating trained model..."
-        test -f /app/models/best_fraud_detection_model.pkl || (echo "Model file not created" && exit 1)
-        test -f /app/models/best_fraud_detection_model_metadata.json || (echo "Metadata file not created" && exit 1)
-        echo "✓ Model validation passed"
+        test -f models/best_fraud_detection_model.pkl || (echo "Model file not created" && exit 1)
+        test -f models/best_fraud_detection_model_metadata.json || (echo "Metadata file not created" && exit 1)
+        echo "Model validation passed"
         """
     )
     
@@ -96,9 +86,9 @@ with DAG(
         task_id='cleanup_temporary_files',
         bash_command="""
         echo "Cleaning up temporary files..."
-        rm -f /app/confusion_matrix.png
-        rm -rf /app/cache
-        echo "✓ Cleanup completed"
+        rm -f confusion_matrix.png
+        rm -rf cache
+        echo "Cleanup completed"
         """,
         trigger_rule='all_done'  # Run even if upstream tasks fail
     )
@@ -108,11 +98,10 @@ with DAG(
         task_id='notify_completion',
         bash_command="""
         echo "========================================="
-        echo "Weekly Model Retraining Completed"
+        echo "Monthly Model Retraining Completed"
         echo "Timestamp: $(date)"
-        echo "Model: /app/models/best_fraud_detection_model.pkl"
+        echo "Model: models/best_fraud_detection_model.pkl"
         echo "========================================="
-        # TODO: Add email/Slack notification here
         """,
         trigger_rule='all_success'
     )
@@ -123,9 +112,9 @@ with DAG(
     
     # Documentation
     dag.doc_md = """
-    ## Fraud Detection Weekly Retraining Pipeline
+    ## Fraud Detection Monthly Retraining Pipeline
     
-    **Schedule**: Every Sunday at 3:00 AM (weekly)
+    **Schedule**: First day of every month at 3:00 AM (monthly)
     
     **Purpose**: Automatically retrain the fraud detection model with the latest data
     to keep predictions accurate as transaction patterns evolve.
@@ -137,7 +126,7 @@ with DAG(
        - Ensures prerequisites are met
     
     2. **Train Model**
-       - Loads feature-engineered data from CSV
+       - Loads feature-engineered data from PostgreSQL database
        - Trains XGBoost classifier
        - Optimizes decision threshold
        - Evaluates performance metrics
@@ -158,7 +147,7 @@ with DAG(
     
     ### Model Updates:
     
-    - New model automatically replaces old model at: `/app/models/best_fraud_detection_model.pkl`
+    - New model automatically replaces old model at: `models/best_fraud_detection_model.pkl`
     - Inference service picks up new model on next restart
     - Model versioning tracked in MLflow
     

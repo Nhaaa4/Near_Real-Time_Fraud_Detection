@@ -19,7 +19,10 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-load_dotenv(dotenv_path="/app/.env")
+# Ubuntu-specific configuration
+logger.info("Kafka Producer running on Ubuntu environment")
+
+load_dotenv()
 
 fake = Faker()
 

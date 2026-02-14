@@ -20,15 +20,16 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-load_dotenv(dotenv_path="/app/.env")
+load_dotenv()
 
 class HDFSConsumer:
     """Consumer that writes Kafka transactions to HDFS for batch processing"""
     
     def __init__(self):
         self.hdfs_url = os.getenv('HDFS_URL', 'hdfs://namenode:9000')
-        self.hdfs_path = f"{self.hdfs_url}/fraud_detection/transactions"
-        self.kafka_bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'kafka:29092')
+        hdfs_base_path = os.getenv('HDFS_PATH', '/fraud_detection')
+        self.hdfs_path = f"{self.hdfs_url}{hdfs_base_path}/transactions"
+        self.kafka_bootstrap = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
         self.kafka_topic = os.getenv('KAFKA_TOPIC', 'transactions')
         
         logger.info(f"Initializing HDFS Consumer")
